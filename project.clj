@@ -12,4 +12,7 @@
                    [cheshire "5.8.0"]
                    [clj-http "3.7.0"]
                  ]
-)
+  :aot  [catalog-api.core]
+  :main catalog-api.core
+
+  )

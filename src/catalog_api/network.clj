@@ -9,6 +9,7 @@
 (def base-uri "https://sandbox.api.fluentretail.com/")
 (def base-api (str base-uri "api/v4.1/"))
 
+
 (def default-env {:client-id     "xxx"
                   :client-secret "yyy"
                   :username "zzz"
@@ -28,6 +29,8 @@
 (def product-endpoint (str base-api "product"))
 (def sku-search-endpoint (str base-api "sku"))
 (def job-endpoint (str base-api "job"))
+(def event-endpoint (str base-api "event"))
+(def create-event-endpoint (str base-api "event/sync"))
 
 (def bearer (atom "<no auth>"))
 
@@ -115,6 +118,18 @@
               (http/post url (merge {:query-params params :body (generate-string data)} (default-config (merge headers {"Content-Type" "application/json"}))))))
     )
   )
+
+(defn sf-auth-header[auth] {"Authorization"  (str "Bearer " auth)})
+
+(defn sf-default-config [headers auth]
+  {:headers (merge headers (sf-auth-header auth)) :with-credentials? false :throw-exceptions false :as :json}
+  )
+
+(defn sf-post [url data headers auth]
+ ;  (println (str "Posting to url " url " with data: " data))
+   (request (fn []
+              (http/post url (merge {:body (generate-string data)} (sf-default-config (merge headers {"Content-Type" "application/json"}) auth)))))
+    )
 
 (defn fr-put
   ([url data headers ]
@@ -227,3 +242,8 @@
 (defn create-batch [batch job-id]
   (fr-post (str job-endpoint "/" job-id "/batch") batch {})
   )
+
+(defn create-event[event fluent-account]
+  (fr-post create-event-endpoint event {"fluent.account" fluent-account})
+  )
+
