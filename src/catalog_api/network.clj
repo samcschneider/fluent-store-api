@@ -9,18 +9,15 @@
 (def base-uri "https://sandbox.api.fluentretail.com/")
 (def base-api (str base-uri "api/v4.1/"))
 
-
 (def default-env {:client-id     "xxx"
                   :client-secret "yyy"
                   :username "zzz"
-                  :password "aaa"})
+                  :password "aaa"
+                  :retailer-id 1})
 
-(def token-url (str base-uri "oauth/token?username="
-                    (:username default-env) "&password="
-                    (:password default-env) "&scope=api&client_id="
-                    (:client-id default-env) "&client_secret="
-                    (:client-secret default-env) "&grant_type=password"))
+(def current-env (atom default-env))
 
+(def token-url (str base-uri "oauth/token"))
 (def order-endpoint (str base-api "order"))
 (def location-endpoint (str base-api "location"))
 (def fulfillment-options-endpoint (str base-api "fulfilmentOptions"))
@@ -47,7 +44,7 @@
 
 (defn renew-token![]
    (let [response (http/post token-url
-                              {:form-params       (merge default-env {:grant_type "password"})
+                              {:form-params       (merge @current-env {:grant_type "password" :scope "api"})
                                :with-credentials? false
                                :as                :json
                                :throw-exceptions false

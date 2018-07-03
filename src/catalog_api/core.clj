@@ -6,8 +6,18 @@
             [clojure.pprint :as pprint]
             [cheshire.core :refer :all]
             [io.pedestal.http.body-params :as bp]
-            [catalog-api.network :as net])
+            [catalog-api.network :as net]
+            [taoensso.faraday :as far]
+            )
   (:gen-class))
+
+(def client-opts
+  {;;; For DDB Local just use some random strings here, otherwise include your
+   ;;; production IAM keys:
+   :access-key "xxx"
+   :secret-key "yyy"
+   :endpoint "http://localhost:8000"
+   })
 
 (defn response [status body & {:as headers}]
   {:status status :body body :headers headers})
@@ -17,6 +27,36 @@
 (def accepted (partial response 202))
 
 (defonce database (atom {}))
+
+(defn- dynamo-sync [db]
+  (doseq [[k v] db]
+    ;TODO need conditional... if not exists... update-item instead?
+    (far/put-item client-opts :sites (merge {:id k} v))
+    )
+  )
+
+(defn- strip-colon [val]
+  (if (clojure.string/starts-with? val ":")
+    (clojure.string/replace-first val ":" "")
+    val
+    )
+  )
+
+(defn- symbol-key-to-string-key[source-map]
+  (reduce-kv (fn [m k v]
+               (assoc m (if (or (symbol? k) (clojure.string/starts-with? (str k) ":")) (strip-colon (str k)) k) v)
+               ) {} source-map)
+  )
+
+(defn- remap-dynamo-site[site]
+  (-> site
+      (assoc :locations (symbol-key-to-string-key (:locations site)))
+      (assoc :categories (symbol-key-to-string-key (:categories site)))
+      (assoc :products (symbol-key-to-string-key (:products site)))
+      (assoc :environments (symbol-key-to-string-key (:environments site)))
+      (assoc :customers (symbol-key-to-string-key (:customers site)))
+      )
+  )
 
 (defn find-site-by-id [dbval db-id]
   (get dbval db-id))
@@ -34,6 +74,21 @@
                (assoc-in context [:request :database] @database))
                context
              ))})
+
+(def dynamo-sync-interceptor
+  {:name :dynamo-interceptor
+
+   :leave
+         (fn [context]
+           (let [db (get-in context [:request :database])]
+             ;just sync entire db on update requests... db is not expected to be large
+             (if-let [[op & args] (:dynamo-tx context)]
+               (apply op args) ;specific dynamo op requested do that, otherwise sync entire db
+               (dynamo-sync db)
+             ))
+             context
+             )}
+  )
 
 (def entity-render
   ;generate-string item ... doesn't seem to eliminate the symbol keys :(
@@ -75,7 +130,9 @@
    :enter
          (fn [context]
            (if-let [db-id (get-in context [:request :path-params :site-id])]
-             (if-let [site (find-site-by-id (get-in context [:request :database]) db-id)]
+             (if-let
+               [site (remap-dynamo-site (far/get-item client-opts :sites {:id db-id}))]
+               ;[site (find-site-by-id (get-in context [:request :database]) db-id)]
                (assoc context :result site)
                context)
              context))})
@@ -88,6 +145,7 @@
              (if-let [site (find-site-by-id (get-in context [:request :database]) db-id)]
                (assoc context
                  :tx-data [dissoc db-id]
+                 :dynamo-tx [far/delete-item client-opts :sites {:id db-id}]
                  :response (accepted {:deleted db-id}))
                context
                )
@@ -139,14 +197,54 @@
                :response (created new-category "Location" url)
                :tx-data [assoc-in [site-id :categories db-id] new-category])))})
 
-;expecting a structure like this for customer:
-; {
-;  :name {:first :last}
-;  :email "foo@bar.com"
-;  :saved-payment {:payment fields ... }
-;  :saved-address {:address fields ... }
-;  :attributes { :loyalty-level "Platinum" }
-; }
+(def environment-create
+  {:name :environment-create
+   :enter
+         (fn [context]
+           (let [environment (get-in context [:request :json-params])
+                 db (get-in context [:request :database])
+                 site-id (get-in context [:request :path-params :site-id])
+                 db-id (db-key "e")
+                 new-environment (assoc environment :id db-id)
+                 url (route/url-for :environment-view :params {:environment-id db-id})]
+             (assoc context
+               :response (created new-environment "Location" url)
+               :tx-data [assoc-in [site-id :environments db-id] new-environment])))})
+
+(def environment-view
+  {:name :environment-view
+   :enter
+         (fn [context]
+           (if-let [site-id (get-in context [:request :path-params :site-id])]
+             (if-let [environment-id (get-in context [:request :path-params :environment-id])]
+               (if-let [environment (get-in (get-in context [:request :database]) [site-id :environments environment-id])]
+                 (assoc context :result environment))
+               context)
+             context))})
+
+(def config-create
+  ;expecting: { :default-env "some-name" :default-user "some-user" }
+  {:name :config-create
+   :enter
+         (fn [context]
+           (let [config (get-in context [:request :json-params])
+                 db (get-in context [:request :database])
+                 site-id (get-in context [:request :path-params :site-id])
+                 url (route/url-for :config-view)]
+             (assoc context
+               :response (created config "Location" url)
+               :tx-data [assoc-in [site-id :config] config])))})
+
+(def config-view
+  {:name :config-view
+   :enter
+         (fn [context]
+           (if-let [site-id (get-in context [:request :path-params :site-id])]
+               (if-let [config (get-in (get-in context [:request :database]) [site-id :config])]
+                 (assoc context :result config))
+               context)
+             context)})
+
 (def customer-create
   {:name :customer-create
    :enter
@@ -160,6 +258,21 @@
              (assoc context
                :response (created new-customer "Location" url)
                :tx-data [assoc-in [site-id :customers db-id] new-customer])))})
+
+(def customer-delete
+  {:name :customer-delete
+   :enter
+         (fn [context]
+           (if-let [site-id (get-in context [:request :path-params :site-id])]
+             (if-let [customer-id (get-in context [:request :path-params :customer-id])]
+               (let [db (get-in context [:request :database])
+                     customers (dissoc (get-in db [site-id :customers]) customer-id)]
+                 (assoc context
+                   :tx-data [assoc-in [site-id :customers] customers]
+                   :response (accepted {:deleted customer-id}))
+                 )
+               context)
+             context))})
 
 (def location-create
   {:name :location-create
@@ -361,6 +474,41 @@
    }
   )
 
+(def dynamo-checkpoint-create
+  {
+   :name :dynamo-checkpoint-create
+   :enter
+         (fn [context]
+           (let [db (get-in context [:request :database])]
+             (dynamo-sync db)
+             )
+           )
+   }
+  )
+
+(defn restore-from-dynamo![]
+  (let [sites (far/scan client-opts :sites)
+        dynamo (reduce (fn [col item]
+                         (let [site-id (:id item)]
+                           (assoc col site-id (remap-dynamo-site item))
+                           )
+                         ) {} sites)
+        ]
+    (println (str "Restring database from converted dynamo: " dynamo))
+    (reset! database dynamo)
+    )
+  )
+
+(def dynamo-restore
+  {
+   :name :dynamo-restore
+   :enter
+         (fn [context]
+           (restore-from-dynamo!)
+           )
+   }
+  )
+
 (def echo
   {:name :echo
    :enter
@@ -428,8 +576,6 @@
     )
   )
 
-
-
 (defn pass-failed-ship-compliant [source msg]
   (let [event (select-keys source [:accountId :retailerId :entityId :entitySubtype :entityType])
         attributes {:message {:compliance-status "passed"
@@ -446,7 +592,6 @@
     )
   )
 ;NON_COMPLIANT_COMMS
-
 
 (defn sf-case[source]
   (let [auth "00D6A000002iQem!ARMAQN61URqT7XwDkQka5KJWu8EyXS9JkbS2J6P85y1xS1vdwpgEnsdEyY7XZlTsU_BOqnH6IAYzERZGQOE0Wsy.yPJCTvJY"
@@ -491,10 +636,6 @@
        (println event-data)
        (net/create-event event-data account)
        (sf-case source)
-       ;(net/create-event (-> event-data
-       ;                      (assoc :name "EmailSFSC")
-       ;                      (assoc :entity-status "NON-COMPLIANT")
-       ;                      ) account)
        )
      )
 
@@ -519,24 +660,31 @@
 (def routes
   (route/expand-routes
     #{
-      ["/site"                    :post   [db-interceptor (bp/body-params) site-create] :route-name :site-create]
+      ["/site"                    :post   [dynamo-sync-interceptor db-interceptor (bp/body-params) site-create] :route-name :site-create]
       ["/site"                    :get    [entity-render db-interceptor all-sites-view] :route-name :all-sites]
       ["/site/:site-id"           :get    [entity-render db-interceptor site-view] :route-name :site-view]
-      ["/site/:site-id"           :delete [entity-render  db-interceptor site-delete] :route-name :site-del]
-      ["/site/:site-id/category"  :post   [db-interceptor (bp/body-params) category-create] :route-name :category-create]
+      ["/site/:site-id"           :delete [dynamo-sync-interceptor entity-render db-interceptor site-delete] :route-name :site-del]
+      ["/site/:site-id/category"  :post   [dynamo-sync-interceptor db-interceptor (bp/body-params) category-create] :route-name :category-create]
       ["/site/:site-id/category/:category-id"  :get   [entity-render db-interceptor category-view] :route-name :category-view]
-      ["/site/:site-id/category/:category-id"  :delete   [entity-render db-interceptor category-delete] :route-name :category-delete]
-      ["/site/:site-id/location"  :post   [db-interceptor (bp/body-params) location-create] :route-name :location-create]
+      ["/site/:site-id/category/:category-id"  :delete   [dynamo-sync-interceptor entity-render db-interceptor category-delete] :route-name :category-delete]
+      ["/site/:site-id/location"  :post   [dynamo-sync-interceptor db-interceptor (bp/body-params) location-create] :route-name :location-create]
       ["/site/:site-id/location/:location-id"  :get   [entity-render db-interceptor location-view] :route-name :location-view]
-      ["/site/:site-id/product"   :post   [db-interceptor (bp/body-params) product-create] :route-name :product-create]
+      ["/site/:site-id/product"   :post   [dynamo-sync-interceptor db-interceptor (bp/body-params) product-create] :route-name :product-create]
       ["/site/:site-id/product/:product-id" :get [entity-render db-interceptor product-view] :route-name :product-view]
-      ["/site/:site-id/product/:product-id" :delete [entity-render db-interceptor product-delete] :route-name :product-delete]
+      ["/site/:site-id/product/:product-id" :delete [dynamo-sync-interceptor entity-render db-interceptor product-delete] :route-name :product-delete]
       ["/db-checkpoint"           :post   [db-interceptor (bp/body-params) db-checkpoint-create] :route-name :db-checkpoint-create]
-      ["/db-restore"              :post   [db-interceptor (bp/body-params) db-restore] :route-name :db-restore]
+      ["/db-restore"              :post   [dynamo-sync-interceptor db-interceptor (bp/body-params) db-restore] :route-name :db-restore]
+      ["/dynamo-checkpoint"           :post   [db-interceptor (bp/body-params) dynamo-checkpoint-create] :route-name :dynamo-checkpoint-create]
+      ["/dynamo-restore"              :post   [db-interceptor (bp/body-params) dynamo-restore] :route-name :dynamo-restore]
       ["/order"                   :post [db-interceptor (bp/body-params) receive-order] :route-name :receive-order]
       ["/ship-compliant-check"    :post [entity-render db-interceptor (bp/body-params) process-ship-compliant] :route-name :process-ship-compliant]
-      ["/site/:site-id/customer"  :post   [db-interceptor (bp/body-params) customer-create] :route-name :customer-create]
+      ["/site/:site-id/customer"  :post   [dynamo-sync-interceptor db-interceptor (bp/body-params) customer-create] :route-name :customer-create]
       ["/site/:site-id/customer/:customer-id"  :get   [entity-render db-interceptor customer-view] :route-name :customer-view]
+      ["/site/:site-id/customer/:customer-id"  :delete   [dynamo-sync-interceptor entity-render db-interceptor customer-delete] :route-name :customer-delete]
+      ["/site/:site-id/environment"  :post   [dynamo-sync-interceptor db-interceptor (bp/body-params) environment-create] :route-name :environment-create]
+      ["/site/:site-id/environment/:environment-id"  :get   [entity-render db-interceptor environment-view] :route-name :environment-view]
+      ["/site/:site-id/config"  :post   [dynamo-sync-interceptor db-interceptor (bp/body-params) config-create] :route-name :config-create]
+      ["/site/:site-id/config"  :get   [entity-render db-interceptor config-view] :route-name :config-view]
       }))
 
 ;TODO add all categories view...
@@ -544,16 +692,18 @@
 (def service-map
   {::http/routes routes
    ::http/type   :jetty
-   ::http/allowed-origins ["http://localhost:3449" "chrome-extension://fhbjgbiflinjbdggehcddcbncdddomop"]
+   ::http/allowed-origins (constantly true)
    ::http/port   8890})
 
 (defn start [args]
+  (restore-from-dynamo!)
   (http/start (http/create-server (merge service-map args))))
 
 ;; For interactive development
 (defonce server (atom nil))
 
 (defn start-dev []
+  (restore-from-dynamo!)
   (reset! server
           (http/start (http/create-server
                         (assoc service-map
