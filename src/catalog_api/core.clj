@@ -8,6 +8,7 @@
             [io.pedestal.http.body-params :as bp]
             [catalog-api.network :as net]
             [taoensso.faraday :as far]
+            [clojure.tools.nrepl.server :as nr]
             )
   (:gen-class))
 
@@ -689,18 +690,23 @@
 
 ;TODO add all categories view...
 
+(defonce nrepl-server (atom nil))
+
 (def service-map
   {::http/routes routes
    ::http/type   :jetty
    ::http/allowed-origins (constantly true)
+   ::http/resource-path "/public"
    ::http/port   8890})
 
 (defn start [args]
   (restore-from-dynamo!)
-  (http/start (http/create-server (merge service-map args))))
+  (http/start (http/create-server (merge service-map args)))
+  )
 
 ;; For interactive development
 (defonce server (atom nil))
+
 
 (defn start-dev []
   (restore-from-dynamo!)
@@ -722,9 +728,34 @@
 (defn -main
   [& args]
   (let [argmap (apply hash-map args)]
-    (if-let [port (get argmap "-port")]
-      (start (merge argmap {::http/port (Integer/parseInt port)}))
-      (start argmap)
+
+    (if-let [nrepl-port (get argmap "-nrport")]
+      (do
+        (println "Starting nrepl on port " nrepl-port)
+        (reset! nrepl-server (nr/start-server :port (Integer/parseInt nrepl-port)))
+        )
+      (do
+        (println "Starting nrepl on port " 9088)
+        (reset! nrepl-server (nr/start-server :port 9088))
+        (println @nrepl-server)
+        )
+      )
+
+    (start
+      (-> {}
+          (merge
+            (if-let [port (get argmap "-port")]
+              {::http/port (Integer/parseInt port)}
+              nil
+              )
+            )
+          (merge
+            (if-let [static-file-location (get argmap "-static-files")]
+              {::http/file-path static-file-location}
+              nil
+              )
+            )
+          )
       )
     )
- )
+  )

@@ -12,6 +12,7 @@
                    [cheshire "5.8.0"]
                    [clj-http "3.7.0"]
                    [com.taoensso/faraday "1.9.0"]
+                   [org.clojure/tools.nrepl "0.2.12"]
                  ]
   :aot  [catalog-api.core]
   :main catalog-api.core
